@@ -1,0 +1,13 @@
+# a5er-auto-layout の動作確認用サンプル DB（PostgreSQL・20テーブル）
+services:
+  sample-db:
+    image: postgres:16
+    container_name: a5er-sample-db
+    environment:
+      POSTGRES_DB: sampledb
+      POSTGRES_USER: sample
+      POSTGRES_PASSWORD: sample
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro

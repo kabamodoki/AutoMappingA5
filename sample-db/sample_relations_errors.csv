@@ -1,0 +1,4 @@
+﻿親テーブル,子テーブル,親カラム,子カラム,親側種別,子側種別,依存
+nope,reviews,id,product_id,,,
+products,reviews,id,no_such_column,,,
+order_items,shipment_items,"order_id,line_no",order_id,,,
