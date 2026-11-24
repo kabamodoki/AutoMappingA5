@@ -436,6 +436,14 @@ public final class A5erTool {
         final String mainPage;
         final boolean logicalView;
         int unrouted;
+        /** [Manager] の PageInfo 行: [行番号, 大文字のページ名]。 */
+        final List<Object[]> pageInfos = new ArrayList<>();
+        /** [Manager] の Page= 行の番号（無ければ null）。 */
+        Integer managerPageIdx;
+        /** 整列で決めた用紙: 大文字のページ名 → [元の表記のページ名, 用紙の値]。 */
+        final Map<String, String[]> papers = new LinkedHashMap<>();
+        /** 結果に出す用紙の説明。 */
+        final List<String> paperNotes = new ArrayList<>();
 
         Document(TextFile file, List<Table> tables, List<Relation> relations, double fontSize, String mainPage,
                  boolean logicalView) {
@@ -463,6 +471,8 @@ public final class A5erTool {
         String section = null;
         Table table = null;
         Relation rel = null;
+        List<Object[]> pageInfos = new ArrayList<>();
+        Integer managerPageIdx = null;
 
         for (int i = 0; i < lines.size(); i++) {
             String body = splitEol(lines.get(i))[0];
@@ -527,8 +537,15 @@ public final class A5erTool {
                     } catch (NumberFormatException e) {
                         // そのまま
                     }
-                } else if (key.equals("Page") && !value.isEmpty()) {
-                    mainPage = value;
+                } else if (key.equals("Page")) {
+                    managerPageIdx = i;
+                    if (!value.isEmpty()) {
+                        mainPage = value;
+                    }
+                } else if (key.equals("PageInfo")) {
+                    List<String> tok = CsvTools.fieldTokens(value);
+                    String name = unquote(tok.get(0));
+                    pageInfos.add(new Object[] {i, (name.isEmpty() ? DEFAULT_PAGE : name).toUpperCase(Locale.ROOT)});
                 } else if (key.equals("LogicalView")) {
                     logicalView = !value.strip().equals("0");
                 }
@@ -550,7 +567,10 @@ public final class A5erTool {
         for (Table t : tables) {
             buildPlacements(t, lines, fk.getOrDefault(t.name(), Set.of()), k, logicalView);
         }
-        return new Document(file, tables, relations, fontSize, mainPage, logicalView);
+        Document doc = new Document(file, tables, relations, fontSize, mainPage, logicalView);
+        doc.pageInfos.addAll(pageInfos);
+        doc.managerPageIdx = managerPageIdx;
+        return doc;
     }
 
     static void buildPlacements(Table t, List<String> lines, Set<String> fk, double k, boolean logicalView) {
@@ -1052,7 +1072,71 @@ public final class A5erTool {
         int margin = 50;
         boolean keepLines = false;
         /** ヘッダの無いリレーション CSV を論理名として読む（一括モード用）。 */
-        boolean logicalRelations = false;
+        boolean logicalCsv = false;
+        /** 用紙: a-landscape / a-portrait / b-landscape / b-portrait / keep（変えない）。landscape・portrait は A 判。 */
+        String paper = "a-landscape";
+
+        static final Set<String> PAPERS = Set.of("a-landscape", "a-portrait", "b-landscape", "b-portrait", "keep", "landscape", "portrait");
+
+        boolean keepPaper() {
+            return paper.equals("keep");
+        }
+
+        boolean landscape() {
+            return paper.endsWith("landscape");
+        }
+
+        /** 0 = A 判、1 = B 判。 */
+        int series() {
+            return paper.startsWith("b-") ? 1 : 0;
+        }
+
+        /** まとめるときの縦横比（幅 / 高さ）。 */
+        double aspect() {
+            if (keepPaper()) {
+                return 1.0;
+            }
+            return landscape() ? Paper.RATIO : 1 / Paper.RATIO;
+        }
+    }
+
+    /**
+     * A5:SQL Mk-2 のページの用紙。図の座標での大きさ = 用紙の mm × 10 − 100（実機で測定）。
+     * B 判は JIS。B1 は A5:SQL Mk-2 が扱えない（A3 横として表示される）ので使わない。
+     */
+    static final class Paper {
+        static final double RATIO = 1.43;
+        static final String[][] NAMES = {{"A4", "A3", "A2", "A1"}, {"B4", "B3", "B2"}};
+        static final int[][][] PORTRAIT = { // 幅, 高さ
+            {{2000, 2870}, {2870, 4100}, {4100, 5840}, {5840, 8310}},
+            {{2470, 3540}, {3540, 5050}, {5050, 7180}}};
+
+        private Paper() {
+        }
+
+        /** 右端 right・下端 bottom まで収まる一番小さい用紙の番号。収まらなければ NAMES[series].length。 */
+        static int fit(int series, double right, double bottom, boolean landscape) {
+            for (int i = 0; i < NAMES[series].length; i++) {
+                int w = landscape ? PORTRAIT[series][i][1] : PORTRAIT[series][i][0];
+                int h = landscape ? PORTRAIT[series][i][0] : PORTRAIT[series][i][1];
+                if (right <= w && bottom <= h) {
+                    return i;
+                }
+            }
+            return NAMES[series].length;
+        }
+
+        static String name(int series, int index) {
+            return NAMES[series][Math.min(index, NAMES[series].length - 1)];
+        }
+
+        static String value(int series, int index, boolean landscape) {
+            return name(series, index) + (landscape ? "Landscape" : "Portrait");
+        }
+
+        static String label(int series, int index, boolean landscape) {
+            return name(series, index) + (landscape ? " 横" : " 縦");
+        }
     }
 
     /** 整列の結果。 */
@@ -1061,6 +1145,7 @@ public final class A5erTool {
         final int tables;
         final int pages;
         final int unrouted;
+        final List<String> paperNotes = new ArrayList<>();
 
         LayoutResult(byte[] data, int tables, int pages, int unrouted) {
             this.data = data;
@@ -1073,6 +1158,9 @@ public final class A5erTool {
             String text = "整列しました: テーブル " + tables + " 個 / ページ " + pages;
             if (unrouted > 0) {
                 text += " / 重ならずに線を引けなかったリレーション " + unrouted + " 本（線は元のまま）";
+            }
+            if (!paperNotes.isEmpty()) {
+                text += " / 用紙: " + String.join("、", paperNotes);
             }
             return text;
         }
@@ -1091,7 +1179,9 @@ public final class A5erTool {
                 throw new ToolException("テーブル（[Entity]）が見つかりません。.a5er ファイルか確認してください。");
             }
             int pages = arrange(doc, opt);
-            return new LayoutResult(doc.file.encode(apply(doc)), doc.tables.size(), pages, doc.unrouted);
+            LayoutResult r = new LayoutResult(doc.file.encode(apply(doc)), doc.tables.size(), pages, doc.unrouted);
+            r.paperNotes.addAll(doc.paperNotes);
+            return r;
         }
 
         static int arrange(Document doc, Options opt) {
@@ -1103,10 +1193,55 @@ public final class A5erTool {
             }
             double k = doc.fontSize / BASE_FONT_SIZE;
             doc.unrouted = 0;
+            Set<String> selfLoops = new HashSet<>();
+            for (Relation r : doc.relations) {
+                if (r.parent.equals(r.child)) {
+                    selfLoops.add(r.parent);
+                }
+            }
             for (Map.Entry<String, List<Placement>> e : pages.entrySet()) {
                 doc.unrouted += layoutPage(e.getValue(), doc.relations, e.getKey(), opt, k);
+                if (!opt.keepPaper()) {
+                    choosePaper(doc, e.getKey(), e.getValue(), opt, k, selfLoops);
+                }
             }
             return pages.size();
+        }
+
+        /** 整列後のページに収まる一番小さい A 判を決める。 */
+        static void choosePaper(Document doc, String page, List<Placement> nodes, Options opt, double k, Set<String> selfLoops) {
+            double right = 0;
+            double bottom = 0;
+            String original = null;
+            for (Placement p : nodes) {
+                double[] o = toBox(p, k, selfLoops.contains(p.table.name())).occupied();
+                right = Math.max(right, o[2]);
+                bottom = Math.max(bottom, o[3]);
+                if (original == null && p.posIdx != null) {
+                    String[] pos = parsePosition(valueOf(doc.lines().get(p.posIdx)));
+                    if (pos != null && !unquote(pos[0]).isEmpty()) {
+                        original = unquote(pos[0]);
+                    }
+                }
+            }
+            boolean landscape = opt.landscape();
+            int series = opt.series();
+            int index = Paper.fit(series, right + opt.margin, bottom + opt.margin, landscape);
+            if (original == null) {
+                original = page.equals(DEFAULT_PAGE) ? doc.mainPage : page;
+            }
+            doc.papers.put(page, new String[] {original, Paper.value(series, index, landscape)});
+            String note = original + "=" + Paper.label(series, index, landscape);
+            if (index >= Paper.NAMES[series].length) {
+                note += "（" + Paper.label(series, index, landscape) + " に収まりません。はみ出したテーブルは A5:SQL Mk-2 で表示されません）";
+            }
+            doc.paperNotes.add(note);
+        }
+
+        /** 整列で圧縮した幅・高さを、縦横比 r に合わせた値 [a, b] に直す（r = 1 ならそのまま）。 */
+        static double[] normalized(double w, double h, double r) {
+            double s = Math.sqrt(r);
+            return new double[] {w / s, h * s};
         }
 
         static final Comparator<Placement> BY_NAME = Comparator
@@ -1600,13 +1735,20 @@ public final class A5erTool {
         static int compactPage(List<Placement> nodes, List<Rel> rels, String page, Options opt, double k, Set<Integer> loops) {
             Compact best = null;
             double[] bestKey = null;
-            for (int variant = 0; variant < COMPACT_VARIANTS; variant++) {
-                Compact c = new Compact(nodes, rels, opt, k, loops, variant);
-                c.run();
-                double[] key = {c.failed.size(), Math.max(c.width, c.height), c.width + c.height};
-                if (bestKey == null || Arrays.compare(key, bestKey) < 0) {
-                    best = c;
-                    bestKey = key;
+            for (double limit : spanLimits(nodes, opt, k, loops)) {
+                for (int variant = 0; variant < COMPACT_VARIANTS; variant++) {
+                    Compact c = new Compact(nodes, rels, opt, k, loops, variant);
+                    c.limitSpan = limit;
+                    c.spanTall = opt.landscape();
+                    c.run();
+                    double[] ab = normalized(c.width, c.height, opt.aspect());
+                    double paper = opt.keepPaper() ? 0
+                            : Paper.fit(opt.series(), c.width + 2 * opt.margin, c.height + 2 * opt.margin, opt.landscape());
+                    double[] key = {c.failed.size(), paper, Math.max(ab[0], ab[1]), ab[0] + ab[1]};
+                    if (bestKey == null || Arrays.compare(key, bestKey) < 0) {
+                        best = c;
+                        bestKey = key;
+                    }
                 }
             }
             for (Map.Entry<Integer, int[]> e : best.positions.entrySet()) {
@@ -1618,6 +1760,39 @@ public final class A5erTool {
             }
             return best.failed.size();
         }
+
+        /**
+         * 用紙の縦横比にまとめるための、全体の高さ（横向き）または幅（縦向き）の上限の候補。
+         * 上限なし（従来どおり）と、テーブルの面積の合計から見積もった大きさの何倍か。
+         */
+        static List<Double> spanLimits(List<Placement> nodes, Options opt, double k, Set<Integer> loops) {
+            List<Double> out = new ArrayList<>();
+            out.add(Double.MAX_VALUE);
+            if (opt.keepPaper()) {
+                return out;
+            }
+            double area = 0;
+            double minSpan = 0;
+            for (int i = 0; i < nodes.size(); i++) {
+                double[] o = toBox(nodes.get(i), k, loops.contains(i), 0, 0).occupied();
+                double w = o[2] - o[0];
+                double h = o[3] - o[1];
+                area += (w + opt.gapX) * (h + opt.gapY);
+                minSpan = Math.max(minSpan, opt.landscape() ? h : w);
+            }
+            double r = opt.aspect();
+            double ideal = opt.landscape() ? Math.sqrt(area * SPAN_FILL / r) : Math.sqrt(area * SPAN_FILL * r);
+            for (double f : SPAN_FACTORS) {
+                double v = Math.max(minSpan, ideal * f);
+                if (!out.contains(v)) {
+                    out.add(v);
+                }
+            }
+            return out;
+        }
+
+        static final double SPAN_FILL = 1.6;
+        static final double[] SPAN_FACTORS = {0.9, 1.0, 1.15, 1.3};
 
         /** 1 通りの順番でのコンパクト配置。 */
         static final class Compact {
@@ -1636,6 +1811,11 @@ public final class A5erTool {
             final Map<Integer, int[]> positions = new HashMap<>();
             double width;
             double height;
+            /** tryPlace で試す場所の評価の上限（reshape で使う）。 */
+            double areaCap = Double.MAX_VALUE;
+            /** 全体の高さ（spanTall）または幅の上限。用紙の縦横比にまとめるために使う。超える場所しか無ければ上限なしで置く。 */
+            double limitSpan = Double.MAX_VALUE;
+            boolean spanTall;
 
             Compact(List<Placement> nodes, List<Rel> rels, Options opt, double k, Set<Integer> loops, int variant) {
                 this.nodes = nodes;
@@ -1678,10 +1858,9 @@ public final class A5erTool {
                 return b;
             }
 
-            static double areaTerm(double[] b) {
-                double w = b[2] - b[0];
-                double h = b[3] - b[1];
-                return 2 * Math.max(w, h) + 0.5 * (w + h);
+            double areaTerm(double[] b) {
+                double[] ab = normalized(b[2] - b[0], b[3] - b[1], opt.aspect());
+                return 2 * Math.max(ab[0], ab[1]) + 0.5 * (ab[0] + ab[1]);
             }
 
             List<int[]> candidates(int i, List<Integer> bases, int[] mults) {
@@ -1800,6 +1979,12 @@ public final class A5erTool {
                     double[] o = t.occupied();
                     double[] nb = {Math.min(cur[0], o[0]), Math.min(cur[1], o[1]), Math.max(cur[2], o[2]), Math.max(cur[3], o[3])};
                     double at = areaTerm(nb);
+                    if ((spanTall ? nb[3] - nb[1] : nb[2] - nb[0]) > limitSpan) {
+                        continue;
+                    }
+                    if (at > areaCap) {
+                        continue; // 仕上げ（reshape）では全体を広げる場所は試さない
+                    }
                     double lb = at;
                     for (int[] pr : partners) {
                         Router.Box other = boxes.get(pr[1] == i ? pr[2] : pr[1]);
@@ -1931,6 +2116,80 @@ public final class A5erTool {
                 return c;
             }
 
+            /**
+             * 縦横比を用紙に寄せる仕上げ: 長すぎる向きの端にあるテーブルを外して置き直し、
+             * 全体の評価（areaTerm）が下がり、線も全部引けるときだけ採る。
+             */
+            void reshape() {
+                for (int round = 0; round < 40; round++) {
+                    boolean improved = false;
+                    double[] b = bbox();
+                    double[] ab = normalized(b[2] - b[0], b[3] - b[1], opt.aspect());
+                    boolean tooTall = ab[1] > ab[0];
+                    List<Integer> edge = new ArrayList<>();
+                    for (Map.Entry<Integer, Router.Box> e : boxes.entrySet()) {
+                        double[] o = e.getValue().occupied();
+                        boolean atEdge = tooTall ? (o[3] >= b[3] - 0.5 || o[1] <= b[1] + 0.5)
+                                : (o[2] >= b[2] - 0.5 || o[0] <= b[0] + 0.5);
+                        if (atEdge) {
+                            edge.add(e.getKey());
+                        }
+                    }
+                    edge.sort(Comparator.comparingLong(this::area).thenComparing(this::name));
+                    for (int v : edge) {
+                        if (boxes.size() == 1 || !boxes.containsKey(v)) {
+                            continue;
+                        }
+                        boolean allRouted = true;
+                        for (int x = 0; x < rels.size(); x++) {
+                            Rel rx = rels.get(x);
+                            if ((rx.a == v || rx.b == v) && failed.contains(x)) {
+                                allRouted = false;
+                            }
+                        }
+                        if (!allRouted) {
+                            continue;
+                        }
+                        double before = areaTerm(bbox());
+                        Router.Box saved = boxes.remove(v);
+                        Map<Integer, Router.Line> savedLines = new HashMap<>();
+                        Map<Integer, int[]> savedBars = new HashMap<>();
+                        for (int x = 0; x < rels.size(); x++) {
+                            Rel rx = rels.get(x);
+                            if ((rx.a == v || rx.b == v) && lineOf.containsKey(x)) {
+                                savedLines.put(x, lineOf.remove(x));
+                                savedBars.put(x, barsOf.get(x));
+                            }
+                        }
+                        areaCap = before + 1;
+                        Choice c = boxes.isEmpty() ? null : firstOf(List.of(
+                            () -> tryPlace(v, new int[] {1, 2}, true, true, Integer.MAX_VALUE),
+                            () -> tryPlace(v, new int[] {3, 4}, true, true, Integer.MAX_VALUE)));
+                        areaCap = Double.MAX_VALUE;
+                        if (c != null) {
+                            double[] nb = bbox();
+                            double[] o = c.box.occupied();
+                            double[] after = {Math.min(nb[0], o[0]), Math.min(nb[1], o[1]), Math.max(nb[2], o[2]), Math.max(nb[3], o[3])};
+                            // 全体が良くなる、または同じ評価のまま長い向きの端から離れるなら採る
+                            boolean leftEdge = tooTall ? (o[3] < b[3] - 0.5 && o[1] > b[1] + 0.5)
+                                    : (o[2] < b[2] - 0.5 && o[0] > b[0] + 0.5);
+                            double at = areaTerm(after);
+                            if (at < before - 1 || (at <= before + 0.5 && leftEdge)) {
+                                commit(v, c);
+                                improved = true;
+                                break; // 端が変わったので数え直す
+                            }
+                        }
+                        boxes.put(v, saved);
+                        lineOf.putAll(savedLines);
+                        barsOf.putAll(savedBars);
+                    }
+                    if (!improved) {
+                        return;
+                    }
+                }
+            }
+
             Choice firstOf(List<Supplier<Choice>> tries) {
                 for (Supplier<Choice> s : tries) {
                     Choice c = s.get();
@@ -1960,13 +2219,40 @@ public final class A5erTool {
                         continue;
                     }
                     final int v = i;
-                    Choice c = firstOf(List.of(
-                        () -> tryPlace(v, new int[] {1, 2}, true, false, MAX_TRIED_POSITIONS),
-                        () -> tryPlace(v, new int[] {1, 2}, true, true, MAX_TRIED_POSITIONS),
-                        () -> tryPlace(v, new int[] {3, 4}, true, true, MAX_TRIED_POSITIONS),
-                        () -> tryPlace(v, new int[] {1, 2, 3}, false, true, MAX_TRIED_POSITIONS)));
-                    commit(i, c);
+                    List<Supplier<Choice>> tries = new ArrayList<>();
+                    if (limitSpan != Double.MAX_VALUE) { // まず上限の中で探す
+                        tries.add(() -> tryPlace(v, new int[] {1, 2}, true, false, MAX_TRIED_POSITIONS));
+                        tries.add(() -> tryPlace(v, new int[] {1, 2}, true, true, MAX_TRIED_POSITIONS));
+                        tries.add(() -> tryPlace(v, new int[] {3, 4}, true, true, MAX_TRIED_POSITIONS));
+                        tries.add(() -> {
+                            double saved = limitSpan;
+                            limitSpan = Double.MAX_VALUE;
+                            Choice c0 = null;
+                            for (int[] m : new int[][] {{1, 2}, {3, 4}}) {
+                                c0 = tryPlace(v, m, true, true, MAX_TRIED_POSITIONS);
+                                if (c0 != null) {
+                                    break;
+                                }
+                            }
+                            limitSpan = saved;
+                            return c0;
+                        });
+                    } else {
+                        tries.add(() -> tryPlace(v, new int[] {1, 2}, true, false, MAX_TRIED_POSITIONS));
+                        tries.add(() -> tryPlace(v, new int[] {1, 2}, true, true, MAX_TRIED_POSITIONS));
+                        tries.add(() -> tryPlace(v, new int[] {3, 4}, true, true, MAX_TRIED_POSITIONS));
+                    }
+                    tries.add(() -> {
+                        double saved = limitSpan;
+                        limitSpan = Double.MAX_VALUE;
+                        Choice c0 = tryPlace(v, new int[] {1, 2, 3}, false, true, MAX_TRIED_POSITIONS);
+                        limitSpan = saved;
+                        return c0;
+                    });
+                    commit(i, firstOf(tries));
                 }
+
+                limitSpan = Double.MAX_VALUE;
 
                 // 手直し: 線を引けなかった Relation の両端のどちらかを、全部の線が引ける場所へ置き直す
                 for (int round = 0; round < 5 && !failed.isEmpty(); round++) {
@@ -2002,6 +2288,10 @@ public final class A5erTool {
                             lineOf.putAll(savedLines);
                         }
                     }
+                }
+
+                if (opt.aspect() != 1.0) {
+                    reshape();
                 }
 
                 double[] b = bbox();
@@ -2052,7 +2342,46 @@ public final class A5erTool {
             for (Relation rel : doc.relations) {
                 applyRelation(lines, rel, doc.mainPage);
             }
-            return lines;
+            return applyPapers(lines, doc);
+        }
+
+        /** 決めた用紙を PageInfo の 3 番目に書く。PageInfo 行の無いページは行を足す。 */
+        static List<String> applyPapers(List<String> lines, Document doc) {
+            Set<String> written = new HashSet<>();
+            Integer last = doc.managerPageIdx;
+            for (Object[] pi : doc.pageInfos) {
+                int idx = (Integer) pi[0];
+                last = idx;
+                String[] paper = doc.papers.get((String) pi[1]);
+                if (paper == null) {
+                    continue;
+                }
+                String[] be = splitEol(lines.get(idx));
+                String[] kv = be[0].split("=", 2);
+                List<String> tok = CsvTools.fieldTokens(kv[1]);
+                while (tok.size() < 4) {
+                    tok.add(tok.size() == 1 ? "2" : tok.size() == 2 ? "\"\"" : "$FFFFFF");
+                }
+                tok.set(2, quote(paper[1]));
+                lines.set(idx, kv[0] + "=" + String.join(",", tok) + be[1]);
+                written.add((String) pi[1]);
+            }
+            List<String> add = new ArrayList<>();
+            for (Map.Entry<String, String[]> e : doc.papers.entrySet()) {
+                if (!written.contains(e.getKey())) {
+                    add.add("PageInfo=" + quote(e.getValue()[0]) + ",2," + quote(e.getValue()[1]) + ",$FFFFFF" + doc.file.eol());
+                }
+            }
+            if (add.isEmpty() || last == null) {
+                return lines; // [Manager] の Page= も PageInfo も無い図には足さない
+            }
+            if (!lines.get(last).endsWith("\n")) {
+                lines.set(last, lines.get(last) + doc.file.eol());
+            }
+            List<String> out = new ArrayList<>(lines.subList(0, last + 1));
+            out.addAll(add);
+            out.addAll(lines.subList(last + 1, lines.size()));
+            return out;
         }
 
         static void applyRelation(List<String> lines, Relation rel, String mainPage) {
@@ -2094,6 +2423,7 @@ public final class A5erTool {
 
     static final List<String> NAMES_HEADER = List.of("テーブル物理名", "カラム物理名", "論理名");
     static final List<String> COMMENTS_HEADER = List.of("テーブル物理名", "カラム物理名", "コメント");
+    static final List<String> LOGICAL_COMMENTS_HEADER = List.of("テーブル論理名", "カラム論理名", "コメント");
     static final List<String> RELATIONS_HEADER = List.of("親テーブル", "子テーブル", "親カラム", "子カラム", "親側種別", "子側種別", "依存");
     static final List<String> LOGICAL_RELATIONS_HEADER = List.of("親テーブル論理名", "子テーブル論理名", "親カラム論理名", "子カラム論理名",
             "親側種別", "子側種別", "依存");
@@ -2402,15 +2732,61 @@ public final class A5erTool {
         // --- コメント ---
 
         static Result exportComments(Model model) {
+            return exportComments(model, false);
+        }
+
+        /** コメントを書き出す。logical なら テーブル・カラムを論理名で書く（論理名が空なら物理名）。 */
+        static Result exportComments(Model model, boolean logical) {
             List<List<String>> rows = new ArrayList<>();
-            rows.add(COMMENTS_HEADER);
+            rows.add(logical ? LOGICAL_COMMENTS_HEADER : COMMENTS_HEADER);
+            int fallback = 0;
             for (Ent e : model.entities) {
-                rows.add(List.of(e.pname, "", e.comment));
+                String t = e.pname;
+                if (logical) {
+                    if (e.lname.isBlank()) {
+                        fallback++;
+                    } else {
+                        t = e.lname;
+                    }
+                }
+                rows.add(List.of(t, "", e.comment));
                 for (Column c : e.columns) {
-                    rows.add(List.of(e.pname, c.physical, c.comment));
+                    String col = c.physical;
+                    if (logical) {
+                        if (c.logical.isBlank()) {
+                            fallback++;
+                        } else {
+                            col = c.logical;
+                        }
+                    }
+                    rows.add(List.of(t, col, c.comment));
                 }
             }
-            return new Result(Csv.write(rows), List.of("コメントを書き出しました: " + (rows.size() - 1) + " 行"));
+            List<String> log = new ArrayList<>();
+            log.add((logical ? "コメントを論理名で書き出しました: " : "コメントを書き出しました: ") + (rows.size() - 1) + " 行");
+            if (fallback > 0) {
+                log.add("論理名が無いため物理名で書いた箇所: " + fallback);
+            }
+            return new Result(Csv.write(rows), log);
+        }
+
+        /** CSV の 1 列目のヘッダが logicalHeader なら true、physicalHeader なら false、ヘッダが無ければ ifNoHeader。 */
+        static boolean isLogicalCsv(byte[] csvData, String logicalHeader, String physicalHeader, boolean ifNoHeader)
+                throws ToolException {
+            for (Csv.Row row : Csv.parse(Csv.decode(csvData))) {
+                if (row.cells.stream().allMatch(c -> c.strip().isEmpty())) {
+                    continue;
+                }
+                String first = row.cells.get(0).strip();
+                if (first.equals(logicalHeader)) {
+                    return true;
+                }
+                if (first.equals(physicalHeader)) {
+                    return false;
+                }
+                return ifNoHeader;
+            }
+            return ifNoHeader;
         }
 
         /** A5:SQL Mk-2 は改行を「\n」の 2 文字で持つ。セル内の本当の改行をそれに置き換える。 */
@@ -2451,17 +2827,41 @@ public final class A5erTool {
         }
 
         static Result importComments(Model model, byte[] csvData) throws ToolException {
+            return importComments(model, csvData, false);
+        }
+
+        /** コメントを反映する。CSV が論理名（ヘッダで判定。無ければ logicalIfNoHeader）なら論理名で探す。 */
+        static Result importComments(Model model, byte[] csvData, boolean logicalIfNoHeader) throws ToolException {
+            boolean logical = isLogicalCsv(csvData, LOGICAL_COMMENTS_HEADER.get(0), COMMENTS_HEADER.get(0), logicalIfNoHeader);
             List<String> lines = new ArrayList<>(model.file.lines);
             Map<Integer, String> inserts = new TreeMap<>(); // LName（無ければ PName）行の後ろに足す Comment 行
             Report rep = new Report();
-            for (Csv.Row row : readCsv(csvData, COMMENTS_HEADER)) {
+            for (Csv.Row row : readCsv(csvData, logical ? LOGICAL_COMMENTS_HEADER : COMMENTS_HEADER)) {
                 String table = row.cells.get(0);
                 String column = row.cells.get(1);
                 String comment = escapeNewlines(row.cells.get(2));
                 if (comment.isEmpty()) {
                     continue;
                 }
-                List<Ent> ents = model.findEntities(table);
+                List<Ent> ents;
+                if (logical) {
+                    Ent e = entityByLogical(model, table);
+                    if (e == AMBIGUOUS_ENT) {
+                        rep.skip(row.lineNo, "論理名「" + table + "」のテーブルが複数あります");
+                        continue;
+                    }
+                    ents = e == null ? List.of() : List.of(e);
+                    if (e != null && !column.isEmpty()) {
+                        String phys = columnByLogical(e, column);
+                        if (phys == AMBIGUOUS) {
+                            rep.skip(row.lineNo, "テーブル「" + table + "」に論理名「" + column + "」のカラムが複数あります");
+                            continue;
+                        }
+                        column = phys == null ? column : phys;
+                    }
+                } else {
+                    ents = model.findEntities(table);
+                }
                 if (ents.isEmpty()) {
                     rep.skip(row.lineNo, "テーブル「" + table + "」がありません");
                     continue;
@@ -2506,7 +2906,12 @@ public final class A5erTool {
                 }
             }
             lastReport = rep;
-            return new Result(model.file.encode(insertLines(lines, inserts, model.file)), rep.lines("コメントを反映"));
+            List<String> log = new ArrayList<>();
+            if (logical) {
+                log.add("（コメント CSV は論理名で指定）");
+            }
+            log.addAll(rep.lines("コメントを反映"));
+            return new Result(model.file.encode(insertLines(lines, inserts, model.file)), log);
         }
 
         // --- リレーション ---
@@ -2651,20 +3056,7 @@ public final class A5erTool {
 
         /** リレーション CSV が論理名か。ヘッダで決め、ヘッダが無ければ ifNoHeader。 */
         static boolean isLogicalRelations(byte[] csvData, boolean ifNoHeader) throws ToolException {
-            for (Csv.Row row : Csv.parse(Csv.decode(csvData))) {
-                if (row.cells.stream().allMatch(s -> s.strip().isEmpty())) {
-                    continue;
-                }
-                String first = row.cells.get(0).strip();
-                if (first.equals(LOGICAL_RELATIONS_HEADER.get(0))) {
-                    return true;
-                }
-                if (first.equals(RELATIONS_HEADER.get(0))) {
-                    return false;
-                }
-                return ifNoHeader;
-            }
-            return ifNoHeader;
+            return isLogicalCsv(csvData, LOGICAL_RELATIONS_HEADER.get(0), RELATIONS_HEADER.get(0), ifNoHeader);
         }
 
         static Result importRelations(Model model, byte[] csvData) throws ToolException {
@@ -2808,6 +3200,9 @@ public final class A5erTool {
                 if (cells.stream().allMatch(String::isEmpty)) {
                     continue;
                 }
+                if (cells.get(0).equals(LOGICAL_COMMENTS_HEADER.get(0))) {
+                    return "comments";
+                }
                 if (cells.get(0).equals(NAMES_HEADER.get(0))) {
                     return cells.size() > 2 && cells.get(2).equals(COMMENTS_HEADER.get(2)) ? "comments" : "names";
                 }
@@ -2829,12 +3224,12 @@ public final class A5erTool {
                 log.addAll(r.log);
             }
             if (comments != null) {
-                Result r = importComments(loadModel(data), comments);
+                Result r = importComments(loadModel(data), comments, opt.logicalCsv);
                 data = r.data;
                 log.addAll(r.log);
             }
             if (relations != null) {
-                Result r = importRelations(loadModel(data), relations, opt.logicalRelations);
+                Result r = importRelations(loadModel(data), relations, opt.logicalCsv);
                 data = r.data;
                 log.addAll(r.log);
             }
@@ -2934,17 +3329,25 @@ public final class A5erTool {
         }
 
         static List<String> exportComments(Path a5er, Path out) throws ToolException {
-            Path dst = out != null ? out : withSuffix(a5er, "comments", ".csv");
+            return exportComments(a5er, out, false);
+        }
+
+        static List<String> exportComments(Path a5er, Path out, boolean logical) throws ToolException {
+            Path dst = out != null ? out : withSuffix(a5er, logical ? "comments_logical" : "comments", ".csv");
             checkOutput(dst, List.of(a5er));
-            CsvTools.Result r = CsvTools.exportComments(CsvTools.loadModel(read(a5er)));
+            CsvTools.Result r = CsvTools.exportComments(CsvTools.loadModel(read(a5er)), logical);
             write(dst, r.data);
             return withOutput(r.log, dst);
         }
 
         static List<String> importComments(Path a5er, Path csv, Path out) throws ToolException {
+            return importComments(a5er, csv, out, false);
+        }
+
+        static List<String> importComments(Path a5er, Path csv, Path out, boolean logicalIfNoHeader) throws ToolException {
             Path dst = out != null ? out : withSuffix(a5er, "comments", ".a5er");
             checkOutput(dst, List.of(a5er, csv));
-            CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(read(a5er)), read(csv));
+            CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(read(a5er)), read(csv), logicalIfNoHeader);
             write(dst, r.data);
             return withOutput(r.log, dst);
         }
@@ -2979,12 +3382,14 @@ public final class A5erTool {
             "  java -jar a5er-tool.jar layout           入力.a5er [-o 出力] [--mode compact|layered|grid] [--keep-lines]",
             "  java -jar a5er-tool.jar export-names     入力.a5er [-o 出力.csv]",
             "  java -jar a5er-tool.jar import-names     入力.a5er 論理名.csv [-o 出力.a5er]",
-            "  java -jar a5er-tool.jar export-comments  入力.a5er [-o 出力.csv]",
-            "  java -jar a5er-tool.jar import-comments  入力.a5er コメント.csv [-o 出力.a5er]",
+            "  java -jar a5er-tool.jar export-comments  入力.a5er [-o 出力.csv] [--logical]",
+            "  java -jar a5er-tool.jar import-comments  入力.a5er コメント.csv [-o 出力.a5er] [--logical]",
             "  java -jar a5er-tool.jar export-relations 入力.a5er [-o 出力.csv] [--logical]",
             "  java -jar a5er-tool.jar import-relations 入力.a5er リレーション.csv [-o 出力.a5er] [--logical]",
             "  java -jar a5er-tool.jar all              入力.a5er [CSV ...] [-o 出力.a5er] [--mode ...] [--keep-lines] [--logical]",
-            "  --logical: リレーション CSV を論理名で書き出す／ヘッダの無いリレーション CSV を論理名として読む",
+            "  --logical: コメント・リレーションの CSV を論理名で書き出す／ヘッダの無い CSV を論理名として読む",
+            "  --paper a-landscape|a-portrait|b-landscape|b-portrait|keep: 整列したページの用紙と並べる形",
+            "          （既定 a-landscape = A 判の横。A4〜A1・B4〜B2 のどれにするかは自動。keep は用紙を変えない）",
             "  整列の細かい指定: --gap-x 60 --gap-y 100 --max-width 3000 --margin 50");
 
         static int run(String[] args) {
@@ -2998,7 +3403,8 @@ public final class A5erTool {
                         case "-o": case "--output": out = Paths.get(args[++i]); break;
                         case "--mode": opt.mode = args[++i]; break;
                         case "--keep-lines": opt.keepLines = true; break;
-                        case "--logical": opt.logicalRelations = true; break;
+                        case "--logical": opt.logicalCsv = true; break;
+                        case "--paper": opt.paper = args[++i]; break;
                         case "--gap-x": opt.gapX = Integer.parseInt(args[++i]); break;
                         case "--gap-y": opt.gapY = Integer.parseInt(args[++i]); break;
                         case "--max-width": opt.maxWidth = Integer.parseInt(args[++i]); break;
@@ -3008,6 +3414,9 @@ public final class A5erTool {
                 }
                 if (!Set.of("compact", "layered", "grid").contains(opt.mode)) {
                     throw new ToolException("--mode は compact / layered / grid のどれかです。");
+                }
+                if (!Options.PAPERS.contains(opt.paper)) {
+                    throw new ToolException("--paper は a-landscape / a-portrait / b-landscape / b-portrait / keep のどれかです。");
                 }
                 List<Path> paths = new ArrayList<>();
                 for (String p : pos) {
@@ -3021,12 +3430,13 @@ public final class A5erTool {
                 switch (args[0]) {
                     case "layout": need(paths, 1); log = Actions.layout(paths.get(0), out, opt); break;
                     case "export-names": need(paths, 1); log = Actions.exportNames(paths.get(0), out); break;
-                    case "export-relations": need(paths, 1); log = Actions.exportRelations(paths.get(0), out, opt.logicalRelations); break;
+                    case "export-relations": need(paths, 1); log = Actions.exportRelations(paths.get(0), out, opt.logicalCsv); break;
                     case "import-names": need(paths, 2); log = Actions.importNames(paths.get(0), paths.get(1), out); break;
-                    case "export-comments": need(paths, 1); log = Actions.exportComments(paths.get(0), out); break;
-                    case "import-comments": need(paths, 2); log = Actions.importComments(paths.get(0), paths.get(1), out); break;
+                    case "export-comments": need(paths, 1); log = Actions.exportComments(paths.get(0), out, opt.logicalCsv); break;
+                    case "import-comments": need(paths, 2);
+                        log = Actions.importComments(paths.get(0), paths.get(1), out, opt.logicalCsv); break;
                     case "import-relations": need(paths, 2);
-                        log = Actions.importRelations(paths.get(0), paths.get(1), out, opt.logicalRelations); break;
+                        log = Actions.importRelations(paths.get(0), paths.get(1), out, opt.logicalCsv); break;
                     case "all": {
                         if (paths.isEmpty()) {
                             throw new ToolException(USAGE);
@@ -3078,8 +3488,9 @@ public final class A5erTool {
         private final JTextField commentsField = new JTextField(40);
         private final JTextField relationsField = new JTextField(40);
         private final JComboBox<String> modeBox = new JComboBox<>(new String[] {"compact", "layered", "grid"});
-        private final JCheckBox keepLines = new JCheckBox("線は変えない（テーブルの位置だけ整列）");
-        private final JCheckBox logicalRels = new JCheckBox("リレーション CSV は論理名");
+        private final JComboBox<String> paperBox = new JComboBox<>(new String[] {"A 判・横", "A 判・縦", "B 判・横", "B 判・縦", "変えない"});
+        private final JCheckBox keepLines =new JCheckBox("線は変えない（テーブルの位置だけ整列）");
+        private final JCheckBox logicalRels = new JCheckBox("コメント・リレーション CSV は論理名");
         private final JTextArea log = new JTextArea(16, 70);
         private final List<JButton> buttons = new ArrayList<>();
         private File lastDir;
@@ -3106,6 +3517,9 @@ public final class A5erTool {
             modeBox.setPrototypeDisplayValue("compact（線が重ならない）");
             modeBox.setToolTipText("compact: 線が重ならないよう正方形に近くまとめる / layered: 親を上・子を下 / grid: 名前順の格子");
             opts.add(modeBox);
+            opts.add(new JLabel("用紙"));
+            paperBox.setToolTipText("整列したページの用紙を、収まる一番小さい A 判（A4〜A1）または B 判（B4〜B2）にし、並びもその縦横比にまとめる");
+            opts.add(paperBox);
             opts.add(keepLines);
             logicalRels.setToolTipText("書き出しを論理名にする。読み込みは CSV のヘッダで自動判定（ヘッダが無いときだけこのチェックに従う）");
             opts.add(logicalRels);
@@ -3113,10 +3527,11 @@ public final class A5erTool {
             JPanel acts = new JPanel(new GridLayout(3, 3, 6, 6));
             acts.setBorder(BorderFactory.createTitledBorder("実行（出力は .a5er と同じフォルダに別名で作ります）"));
             acts.add(button("論理名CSVを書き出す", () -> Actions.exportNames(a5er(), null)));
-            acts.add(button("コメントCSVを書き出す", () -> Actions.exportComments(a5er(), null)));
+            acts.add(button("コメントCSVを書き出す", () -> Actions.exportComments(a5er(), null, logicalRels.isSelected())));
             acts.add(button("リレーションCSVを書き出す", () -> Actions.exportRelations(a5er(), null, logicalRels.isSelected())));
             acts.add(button("論理名を反映", () -> Actions.importNames(a5er(), csv(namesField, "論理名 CSV"), null)));
-            acts.add(button("コメントを反映", () -> Actions.importComments(a5er(), csv(commentsField, "コメント CSV"), null)));
+            acts.add(button("コメントを反映", () -> Actions.importComments(a5er(), csv(commentsField, "コメント CSV"), null,
+                logicalRels.isSelected())));
             acts.add(button("リレーションを追加", () -> Actions.importRelations(a5er(), csv(relationsField, "リレーション CSV"), null,
                 logicalRels.isSelected())));
             acts.add(button("整列", () -> Actions.layout(a5er(), null, options())));
@@ -3230,7 +3645,8 @@ public final class A5erTool {
             Options o = new Options();
             o.mode = (String) modeBox.getSelectedItem();
             o.keepLines = keepLines.isSelected();
-            o.logicalRelations = logicalRels.isSelected();
+            o.logicalCsv = logicalRels.isSelected();
+            o.paper = new String[] {"a-landscape", "a-portrait", "b-landscape", "b-portrait", "keep"}[paperBox.getSelectedIndex()];
             return o;
         }
 

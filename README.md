@@ -25,7 +25,7 @@ java -jar target/a5er-tool.jar
 | ボタン | 必要なファイル | 出力 |
 |---|---|---|
 | 論理名CSVを書き出す | .a5er | `元の名前_names.csv` |
-| コメントCSVを書き出す | .a5er | `元の名前_comments.csv` |
+| コメントCSVを書き出す | .a5er | `元の名前_comments.csv`（論理名のときは `_comments_logical.csv`） |
 | リレーションCSVを書き出す | .a5er | `元の名前_relations.csv`（論理名のときは `_relations_logical.csv`） |
 | 整列 | .a5er | `元の名前_layout.a5er` |
 | 論理名を反映 | .a5er ＋ 論理名 CSV | `元の名前_names.a5er` |
@@ -39,6 +39,14 @@ java -jar target/a5er-tool.jar
 - `compact`（既定）: 上下だけでなく横からもつなぎ、全体をなるべく小さく正方形に近くまとめます。線は重ならない位置に引きます
 - `layered`: リレーションの親を上、子を下の段に並べます（重ならずに引けない線が残りやすいです）
 - `grid`: 全テーブルを名前順の格子に並べます（線は変えません）
+
+### 用紙
+整列したページの用紙（ページのプロパティ）も変えます。
+- `A 判・横`（既定）/ `A 判・縦` / `B 判・横` / `B 判・縦`: A4〜A1（B 判は B4〜B2）のうち、全テーブルが収まる一番小さい用紙を自動で選びます。並びもその用紙の縦横比（約 1.43）に近づけます
+- `変えない`: 用紙はそのままで、並びは正方形に近くまとめます
+- 優先順は「線が重ならない → 用紙が小さい → 形が用紙に近い」です。縦に長いテーブルが多い図では、小さい用紙に収めた結果、用紙の中に余白が残ることがあります
+- A1（B2）にも収まらないときは、その旨を表示します（A5:SQL Mk-2 では用紙からはみ出したテーブルは表示されません）
+- B 判は JIS の大きさです。B1 は A5:SQL Mk-2 が扱えないため使いません
 - 「線は変えない」にチェックすると、テーブルの位置だけ変えます
 
 重ならずに引けない線があった場合は、その本数を表示します（その線は元のまま）。
@@ -62,6 +70,7 @@ users,email,ログイン用。重複不可
 ```
 - 指定のしかたは論理名 CSV と同じです（テーブル＋カラムの組み合わせ。カラムが空ならテーブルのコメント）
 - コメントが空の行は何もしません（今のコメントは消しません）
+- 画面の「コメント・リレーション CSV は論理名」にチェックして書き出すと、テーブル・カラムを論理名で書いた CSV（`テーブル論理名,カラム論理名,コメント`）になります。読み込みはヘッダで自動判定します（決まりは下のリレーションの論理名モードと同じ）
 - A5:SQL Mk-2 はコメントの改行を `
 ` の 2 文字で持ちます。書き出した CSV でも `
 ` と見えます。Excel のセル内で改行した場合は、読み込むときに `
@@ -78,7 +87,7 @@ orders,order_items,"id,shop_id","order_id,shop_id",,,
 - すでにあるリレーションは追加しません
 
 ### 論理名で指定する
-画面の「リレーション CSV は論理名」にチェックして書き出すと、テーブル・カラムを論理名で書いた CSV になります。
+画面の「コメント・リレーション CSV は論理名」にチェックして書き出すと、テーブル・カラムを論理名で書いた CSV になります。
 ```
 親テーブル論理名,子テーブル論理名,親カラム論理名,子カラム論理名,親側種別,子側種別,依存
 顧客,注文,顧客ID,顧客ID,2,3,0
@@ -94,13 +103,14 @@ CSV の書き出しは BOM 付き UTF-8（Excel でそのまま開けます）�
 java -jar target/a5er-tool.jar layout           入力.a5er [-o 出力] [--mode compact|layered|grid] [--keep-lines]
 java -jar target/a5er-tool.jar export-names     入力.a5er [-o 出力.csv]
 java -jar target/a5er-tool.jar import-names     入力.a5er 論理名.csv [-o 出力.a5er]
-java -jar target/a5er-tool.jar export-comments  入力.a5er [-o 出力.csv]
-java -jar target/a5er-tool.jar import-comments  入力.a5er コメント.csv [-o 出力.a5er]
+java -jar target/a5er-tool.jar export-comments  入力.a5er [-o 出力.csv] [--logical]
+java -jar target/a5er-tool.jar import-comments  入力.a5er コメント.csv [-o 出力.a5er] [--logical]
 java -jar target/a5er-tool.jar export-relations 入力.a5er [-o 出力.csv] [--logical]
 java -jar target/a5er-tool.jar import-relations 入力.a5er リレーション.csv [-o 出力.a5er] [--logical]
 java -jar target/a5er-tool.jar all              入力.a5er [CSV ...] [-o 出力.a5er] [--mode ...] [--keep-lines] [--logical]
 ```
-`--logical` は、リレーション CSV を論理名で書き出す／ヘッダの無いリレーション CSV を論理名として読む指定です。
+`--logical` は、コメント・リレーションの CSV を論理名で書き出す／ヘッダの無い CSV を論理名として読む指定です。
+`layout` と `all` には `--paper a-landscape|a-portrait|b-landscape|b-portrait|keep`（用紙。既定 a-landscape）も付けられます。
 `all` は CSV の種類を 1 行目のヘッダで見分けます。
 
 ## 動作確認用のサンプル DB（sample-db/）

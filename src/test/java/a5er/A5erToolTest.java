@@ -223,6 +223,69 @@ class A5erToolTest {
 
     static final Pattern POS_LINE = Pattern.compile("^(Left|Top|Position|Bar[123])=");
 
+    // ------------------------------------------------------------------ 用紙
+
+    @Test
+    void paperFit() {
+        assertEquals(0, A5erTool.Paper.fit(0, 2870, 2000, true));
+        assertEquals(1, A5erTool.Paper.fit(0, 2871, 2000, true));
+        assertEquals(1, A5erTool.Paper.fit(0, 2870, 2001, true));
+        assertEquals(0, A5erTool.Paper.fit(0, 2000, 2870, false));
+        assertEquals(1, A5erTool.Paper.fit(0, 2870, 2000, false));
+        assertEquals(3, A5erTool.Paper.fit(0, 8310, 5840, true));
+        assertEquals(4, A5erTool.Paper.fit(0, 8311, 100, true));
+        assertEquals(0, A5erTool.Paper.fit(1, 3540, 2470, true));
+        assertEquals(2, A5erTool.Paper.fit(1, 7180, 5050, true));
+        assertEquals(3, A5erTool.Paper.fit(1, 7181, 5050, true));
+        assertEquals("A3Landscape", A5erTool.Paper.value(0, 1, true));
+        assertEquals("A1Portrait", A5erTool.Paper.value(0, 4, false));
+        assertEquals("B2Portrait", A5erTool.Paper.value(1, 3, false));
+    }
+
+    @Test
+    void pageInfoIsRewrittenAndAdded() throws Exception {
+        // MAIN は PageInfo（"Main"）を書き換え、Sub は PageInfo を消しておき、足されること
+        String src = text(sample()).replace("PageInfo=\"Sub\",2,\"A3Landscape\",$FFFFFF\n", "");
+        Options o = new Options();
+        A5erTool.LayoutResult r = Layout.layoutBytes(src.getBytes(StandardCharsets.UTF_8), o);
+        String t = text(r.data);
+        assertTrue(t.contains("PageInfo=\"Main\",2,\"A4Landscape\",$FFFFFF\nPageInfo=\"Sub\",2,\"A4Landscape\",$FFFFFF\n"), t);
+        assertTrue(r.summary().contains("用紙: "));
+        o.paper = "portrait";
+        t = text(Layout.layoutBytes(src.getBytes(StandardCharsets.UTF_8), o).data);
+        assertTrue(t.contains("PageInfo=\"Main\",2,\"A4Portrait\",$FFFFFF\n"));
+        o.paper = "keep";
+        t = text(Layout.layoutBytes(src.getBytes(StandardCharsets.UTF_8), o).data);
+        assertTrue(t.contains("PageInfo=\"Main\",2,\"A3Landscape\",$FFFFFF\n"));
+        assertFalse(t.contains("PageInfo=\"Sub\""));
+    }
+
+    @Test
+    void sampleDbFitsAPaperWithAPaperRatio() throws Exception {
+        for (String paper : List.of("a-landscape", "a-portrait", "b-landscape", "b-portrait")) {
+            Options o = new Options();
+            o.paper = paper;
+            byte[] out = Layout.layoutBytes(schemaWithRelations(), o).data;
+            assertTrue(checkLayout(out, schemaWithRelations()) >= 18, paper);
+            double right = 0;
+            double bottom = 0;
+            for (int[] b : boxes(out).values()) {
+                right = Math.max(right, b[0] + b[2]);
+                bottom = Math.max(bottom, b[1] + b[3]);
+            }
+            boolean land = paper.endsWith("landscape");
+            int series = paper.startsWith("b") ? 1 : 0;
+            Matcher m = Pattern.compile("PageInfo=\"Main\",2,\"([AB]\\d)(\\w+)\"").matcher(text(out));
+            assertTrue(m.find());
+            assertEquals(land ? "Landscape" : "Portrait", m.group(2));
+            int idx = java.util.Arrays.asList(A5erTool.Paper.NAMES[series]).indexOf(m.group(1));
+            assertEquals(A5erTool.Paper.fit(series, right + 50, bottom + 50, land), idx);
+            double ratio = land ? (right - 50) / (bottom - 50) : (bottom - 50) / (right - 50);
+            System.out.println(paper + " ratio=" + ratio + " size=" + right + "x" + bottom + " " + m.group(1));
+            assertTrue(ratio > 1.1 && ratio < 1.8, paper + " ratio=" + ratio);
+        }
+    }
+
     // ------------------------------------------------------------------ 整列
 
     @Test
@@ -239,7 +302,7 @@ class A5erToolTest {
                     int changed = 0;
                     for (int i = 0; i < a.length; i++) {
                         if (!a[i].equals(b[i])) {
-                            assertTrue(POS_LINE.matcher(a[i]).find(), a[i]);
+                            assertTrue(POS_LINE.matcher(a[i]).find() || a[i].startsWith("PageInfo="), a[i]);
                             assertEquals(a[i].endsWith("\r"), b[i].endsWith("\r"));
                             changed++;
                         }
@@ -558,6 +621,35 @@ class A5erToolTest {
         CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(src), csv("UTF-8", "t1,,説明"));
         assertEquals(1, CsvTools.lastReport.done);
         assertTrue(text(r.data).contains("LName=t1の論理名\nComment=説明\nTableOption=\n"));
+    }
+
+    @Test
+    void logicalCommentsRoundTripAndLookup() throws Exception {
+        byte[] src = logicalSample();
+        CsvTools.Result ex = CsvTools.exportComments(CsvTools.loadModel(src), true);
+        String[] rows = text(ex.data).split("\r\n");
+        assertEquals("テーブル論理名,カラム論理名,コメント", rows[0]);
+        assertEquals("論理users,,", rows[1]);
+        assertEquals("論理users,列0,", rows[2]);
+        assertEquals("comments", CsvTools.csvKind(ex.data));
+        CsvTools.Result same = CsvTools.importComments(CsvTools.loadModel(src), ex.data);
+        assertEquals(text(src), text(same.data));
+        // 論理名で指定（ヘッダで自動判定）。論理名が重複するテーブルはスキップ
+        String dup = text(src).replace("LName=論理settings", "LName=論理logs");
+        byte[] csv = csv("UTF-8", "テーブル論理名,カラム論理名,コメント", "論理users,,会員", "論理orders,列1,注文の列",
+                "論理logs,列0,x", "論理users,列X,y");
+        CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(dup.getBytes(StandardCharsets.UTF_8)), csv);
+        assertEquals(2, CsvTools.lastReport.done);
+        assertEquals(2, CsvTools.lastReport.skipped.size());
+        assertTrue(CsvTools.lastReport.skipped.get(0).contains("複数"));
+        CsvTools.Model m = CsvTools.loadModel(r.data);
+        assertEquals("会員", m.findEntities("users").get(0).comment);
+        assertEquals("注文の列", m.findEntities("orders").get(0).findColumn("col1").comment);
+        // ヘッダなしはチェック（logicalIfNoHeader）に従う
+        CsvTools.importComments(CsvTools.loadModel(src), csv("UTF-8", "論理users,,会員"), false);
+        assertEquals(1, CsvTools.lastReport.skipped.size());
+        CsvTools.importComments(CsvTools.loadModel(src), csv("UTF-8", "論理users,,会員"), true);
+        assertEquals(1, CsvTools.lastReport.done);
     }
 
     // ------------------------------------------------------------------ リレーション（論理名）
