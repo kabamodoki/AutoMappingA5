@@ -1051,6 +1051,8 @@ public final class A5erTool {
         int maxWidth = 3000;
         int margin = 50;
         boolean keepLines = false;
+        /** ヘッダの無いリレーション CSV を論理名として読む（一括モード用）。 */
+        boolean logicalRelations = false;
     }
 
     /** 整列の結果。 */
@@ -2091,7 +2093,10 @@ public final class A5erTool {
     // =====================================================================
 
     static final List<String> NAMES_HEADER = List.of("テーブル物理名", "カラム物理名", "論理名");
+    static final List<String> COMMENTS_HEADER = List.of("テーブル物理名", "カラム物理名", "コメント");
     static final List<String> RELATIONS_HEADER = List.of("親テーブル", "子テーブル", "親カラム", "子カラム", "親側種別", "子側種別", "依存");
+    static final List<String> LOGICAL_RELATIONS_HEADER = List.of("親テーブル論理名", "子テーブル論理名", "親カラム論理名", "子カラム論理名",
+            "親側種別", "子側種別", "依存");
 
     static final class CsvTools {
         private static final Pattern FIRST_TOKEN = Pattern.compile("^(\"(?:[^\"]|\"\")*\"|[^,]*)(.*)$", Pattern.DOTALL);
@@ -2103,11 +2108,13 @@ public final class A5erTool {
             final int idx;
             String logical;
             final String physical;
+            String comment;
 
-            Column(int idx, String logical, String physical) {
+            Column(int idx, String logical, String physical, String comment) {
                 this.idx = idx;
                 this.logical = logical;
                 this.physical = physical;
+                this.comment = comment;
             }
         }
 
@@ -2115,8 +2122,10 @@ public final class A5erTool {
             String pname = "";
             String page = "";
             String lname = "";
+            String comment = "";
             Integer pnameIdx;
             Integer lnameIdx;
+            Integer commentIdx;
             final List<Column> columns = new ArrayList<>();
 
             Column findColumn(String name) {
@@ -2236,10 +2245,12 @@ public final class A5erTool {
                     switch (key) {
                         case "PName": ent.pname = value; ent.pnameIdx = i; break;
                         case "LName": ent.lname = value; ent.lnameIdx = i; break;
+                        case "Comment": ent.comment = value; ent.commentIdx = i; break;
                         case "Page": ent.page = value; break;
                         case "Field": {
                             List<String> cols = Csv.parseLine(value);
-                            ent.columns.add(new Column(i, cols.isEmpty() ? "" : cols.get(0), cols.size() > 1 ? cols.get(1) : ""));
+                            ent.columns.add(new Column(i, cols.isEmpty() ? "" : cols.get(0), cols.size() > 1 ? cols.get(1) : "",
+                                    cols.size() > 6 ? cols.get(6) : ""));
                             break;
                         }
                         default: break;
@@ -2365,22 +2376,137 @@ public final class A5erTool {
                     rep.done++;
                 }
             }
-            if (!inserts.isEmpty()) {
-                List<String> out = new ArrayList<>();
-                for (int i = 0; i < lines.size(); i++) {
-                    String line = lines.get(i);
-                    if (inserts.containsKey(i) && !line.endsWith("\n")) {
-                        line = line + model.file.eol();
+            lastReport = rep;
+            return new Result(model.file.encode(insertLines(lines, inserts, model.file)), rep.lines("論理名を反映"));
+        }
+
+        /** inserts のキーの行の直後に、その値の行を足す。 */
+        static List<String> insertLines(List<String> lines, Map<Integer, String> inserts, TextFile file) {
+            if (inserts.isEmpty()) {
+                return lines;
+            }
+            List<String> out = new ArrayList<>();
+            for (int i = 0; i < lines.size(); i++) {
+                String line = lines.get(i);
+                if (inserts.containsKey(i) && !line.endsWith("\n")) {
+                    line = line + file.eol();
+                }
+                out.add(line);
+                if (inserts.containsKey(i)) {
+                    out.add(inserts.get(i));
+                }
+            }
+            return out;
+        }
+
+        // --- コメント ---
+
+        static Result exportComments(Model model) {
+            List<List<String>> rows = new ArrayList<>();
+            rows.add(COMMENTS_HEADER);
+            for (Ent e : model.entities) {
+                rows.add(List.of(e.pname, "", e.comment));
+                for (Column c : e.columns) {
+                    rows.add(List.of(e.pname, c.physical, c.comment));
+                }
+            }
+            return new Result(Csv.write(rows), List.of("コメントを書き出しました: " + (rows.size() - 1) + " 行"));
+        }
+
+        /** A5:SQL Mk-2 は改行を「\n」の 2 文字で持つ。セル内の本当の改行をそれに置き換える。 */
+        static String escapeNewlines(String s) {
+            return s.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n");
+        }
+
+        /** Field= の値を、項目の字句（引用符つきのまま）に分ける。 */
+        static List<String> fieldTokens(String value) {
+            List<String> out = new ArrayList<>();
+            StringBuilder cur = new StringBuilder();
+            boolean inQuote = false;
+            for (int i = 0; i < value.length(); i++) {
+                char ch = value.charAt(i);
+                if (ch == '"') {
+                    inQuote = !inQuote;
+                } else if (ch == ',' && !inQuote) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                    continue;
+                }
+                cur.append(ch);
+            }
+            out.add(cur.toString());
+            return out;
+        }
+
+        /** Field= 行の 7 番目（コメント）だけ書き換える。 */
+        static String replaceFieldComment(String line, String comment) {
+            String[] be = splitEol(line);
+            String[] kv = be[0].split("=", 2);
+            List<String> tokens = fieldTokens(kv[1]);
+            while (tokens.size() < 7) {
+                tokens.add("\"\"");
+            }
+            tokens.set(6, quote(comment));
+            return kv[0] + "=" + String.join(",", tokens) + be[1];
+        }
+
+        static Result importComments(Model model, byte[] csvData) throws ToolException {
+            List<String> lines = new ArrayList<>(model.file.lines);
+            Map<Integer, String> inserts = new TreeMap<>(); // LName（無ければ PName）行の後ろに足す Comment 行
+            Report rep = new Report();
+            for (Csv.Row row : readCsv(csvData, COMMENTS_HEADER)) {
+                String table = row.cells.get(0);
+                String column = row.cells.get(1);
+                String comment = escapeNewlines(row.cells.get(2));
+                if (comment.isEmpty()) {
+                    continue;
+                }
+                List<Ent> ents = model.findEntities(table);
+                if (ents.isEmpty()) {
+                    rep.skip(row.lineNo, "テーブル「" + table + "」がありません");
+                    continue;
+                }
+                if (column.isEmpty()) {
+                    for (Ent e : ents) {
+                        if (e.comment.equals(comment)) {
+                            rep.unchanged++;
+                            continue;
+                        }
+                        if (e.commentIdx != null) {
+                            lines.set(e.commentIdx, replaceValue(lines.get(e.commentIdx), comment));
+                        } else {
+                            int after = e.lnameIdx != null ? e.lnameIdx : e.pnameIdx;
+                            String eol = splitEol(lines.get(after))[1];
+                            inserts.put(after, "Comment=" + comment + (eol.isEmpty() ? model.file.eol() : eol));
+                        }
+                        e.comment = comment;
+                        rep.done++;
                     }
-                    out.add(line);
-                    if (inserts.containsKey(i)) {
-                        out.add(inserts.get(i));
+                    continue;
+                }
+                List<Column> hits = new ArrayList<>();
+                for (Ent e : ents) {
+                    Column c = e.findColumn(column);
+                    if (c != null) {
+                        hits.add(c);
                     }
                 }
-                lines = out;
+                if (hits.isEmpty()) {
+                    rep.skip(row.lineNo, "テーブル「" + table + "」にカラム「" + column + "」がありません");
+                    continue;
+                }
+                for (Column c : hits) {
+                    if (c.comment.equals(comment)) {
+                        rep.unchanged++;
+                        continue;
+                    }
+                    lines.set(c.idx, replaceFieldComment(lines.get(c.idx), comment));
+                    c.comment = comment;
+                    rep.done++;
+                }
             }
             lastReport = rep;
-            return new Result(model.file.encode(lines), rep.lines("論理名を反映"));
+            return new Result(model.file.encode(insertLines(lines, inserts, model.file)), rep.lines("コメントを反映"));
         }
 
         // --- リレーション ---
@@ -2440,7 +2566,114 @@ public final class A5erTool {
             return out;
         }
 
+        static final String AMBIGUOUS = "\u0000ambiguous";
+
+        /** 論理名でテーブルを探す。無ければ物理名で探す。複数あれば null（決められない）。 */
+        static Ent entityByLogical(Model model, String name) {
+            String key = name.strip().toLowerCase(Locale.ROOT);
+            List<Ent> hits = new ArrayList<>();
+            for (Ent e : model.entities) {
+                if (e.lname.strip().toLowerCase(Locale.ROOT).equals(key)) {
+                    hits.add(e);
+                }
+            }
+            if (hits.isEmpty()) {
+                List<Ent> phys = model.findEntities(name);
+                return phys.isEmpty() ? null : phys.get(0);
+            }
+            return hits.size() == 1 ? hits.get(0) : AMBIGUOUS_ENT;
+        }
+
+        static final Ent AMBIGUOUS_ENT = new Ent();
+
+        /** 論理名でカラムを探し、物理名を返す。無ければ物理名で探す。見つからなければ null、複数あれば AMBIGUOUS。 */
+        static String columnByLogical(Ent e, String name) {
+            String key = name.strip().toLowerCase(Locale.ROOT);
+            List<Column> hits = new ArrayList<>();
+            for (Column c : e.columns) {
+                if (c.logical.strip().toLowerCase(Locale.ROOT).equals(key)) {
+                    hits.add(c);
+                }
+            }
+            if (hits.isEmpty()) {
+                Column c = e.findColumn(name);
+                return c == null ? null : c.physical;
+            }
+            return hits.size() == 1 ? hits.get(0).physical : AMBIGUOUS;
+        }
+
+        static Result exportRelationsLogical(Model model) {
+            List<List<String>> rows = new ArrayList<>();
+            rows.add(LOGICAL_RELATIONS_HEADER);
+            int fallback = 0;
+            for (Rel r : model.relations) {
+                List<Ent> p = model.findEntities(r.entity1);
+                List<Ent> c = model.findEntities(r.entity2);
+                Ent parent = p.isEmpty() ? null : p.get(0);
+                Ent child = c.isEmpty() ? null : c.get(0);
+                String[] t1 = logicalTable(parent, r.entity1);
+                String[] t2 = logicalTable(child, r.entity2);
+                String[] f1 = logicalFields(parent, r.fields1);
+                String[] f2 = logicalFields(child, r.fields2);
+                fallback += Integer.parseInt(t1[1]) + Integer.parseInt(t2[1]) + Integer.parseInt(f1[1]) + Integer.parseInt(f2[1]);
+                rows.add(List.of(t1[0], t2[0], f1[0], f2[0], r.type1, r.type2, r.dependence));
+            }
+            List<String> log = new ArrayList<>();
+            log.add("リレーションを論理名で書き出しました: " + (rows.size() - 1) + " 件");
+            if (fallback > 0) {
+                log.add("論理名が無いため物理名で書いた箇所: " + fallback);
+            }
+            return new Result(Csv.write(rows), log);
+        }
+
+        /** [書く名前, 物理名で代用した数] */
+        private static String[] logicalTable(Ent e, String physical) {
+            if (e == null || e.lname.isBlank()) {
+                return new String[] {physical, "1"};
+            }
+            return new String[] {e.lname, "0"};
+        }
+
+        private static String[] logicalFields(Ent e, String fields) {
+            List<String> out = new ArrayList<>();
+            int fallback = 0;
+            for (String f : splitFields(fields)) {
+                Column c = e == null ? null : e.findColumn(f);
+                if (c == null || c.logical.isBlank()) {
+                    out.add(f);
+                    fallback++;
+                } else {
+                    out.add(c.logical);
+                }
+            }
+            return new String[] {String.join(",", out), String.valueOf(fallback)};
+        }
+
+        /** リレーション CSV が論理名か。ヘッダで決め、ヘッダが無ければ ifNoHeader。 */
+        static boolean isLogicalRelations(byte[] csvData, boolean ifNoHeader) throws ToolException {
+            for (Csv.Row row : Csv.parse(Csv.decode(csvData))) {
+                if (row.cells.stream().allMatch(s -> s.strip().isEmpty())) {
+                    continue;
+                }
+                String first = row.cells.get(0).strip();
+                if (first.equals(LOGICAL_RELATIONS_HEADER.get(0))) {
+                    return true;
+                }
+                if (first.equals(RELATIONS_HEADER.get(0))) {
+                    return false;
+                }
+                return ifNoHeader;
+            }
+            return ifNoHeader;
+        }
+
         static Result importRelations(Model model, byte[] csvData) throws ToolException {
+            return importRelations(model, csvData, false);
+        }
+
+        /** リレーションを追加する。CSV が論理名なら物理名に直してから追加する。 */
+        static Result importRelations(Model model, byte[] csvData, boolean logicalIfNoHeader) throws ToolException {
+            boolean logical = isLogicalRelations(csvData, logicalIfNoHeader);
             Report rep = new Report();
             Set<String> existing = new HashSet<>();
             for (Rel r : model.relations) {
@@ -2449,24 +2682,44 @@ public final class A5erTool {
             String eol = model.file.eol();
             List<String> newLines = new ArrayList<>();
             int zorder = model.maxZorder;
-            for (Csv.Row row : readCsv(csvData, RELATIONS_HEADER)) {
+            for (Csv.Row row : readCsv(csvData, logical ? LOGICAL_RELATIONS_HEADER : RELATIONS_HEADER)) {
                 List<String> c = row.cells;
                 String pName = c.get(0);
                 String cName = c.get(1);
-                List<Ent> parents = model.findEntities(pName);
-                List<Ent> children = model.findEntities(cName);
-                if (parents.isEmpty()) {
+                Ent parent;
+                Ent child;
+                if (logical) {
+                    parent = entityByLogical(model, pName);
+                    child = entityByLogical(model, cName);
+                    if (parent == AMBIGUOUS_ENT || child == AMBIGUOUS_ENT) {
+                        rep.skip(row.lineNo, "論理名「" + (parent == AMBIGUOUS_ENT ? pName : cName) + "」のテーブルが複数あります");
+                        continue;
+                    }
+                } else {
+                    List<Ent> parents = model.findEntities(pName);
+                    List<Ent> children = model.findEntities(cName);
+                    parent = parents.isEmpty() ? null : parents.get(0);
+                    child = children.isEmpty() ? null : children.get(0);
+                }
+                if (parent == null) {
                     rep.skip(row.lineNo, "親テーブル「" + pName + "」がありません");
                     continue;
                 }
-                if (children.isEmpty()) {
+                if (child == null) {
                     rep.skip(row.lineNo, "子テーブル「" + cName + "」がありません");
                     continue;
                 }
-                Ent parent = parents.get(0);
-                Ent child = children.get(0);
                 List<String> f1 = splitFields(c.get(2));
                 List<String> f2 = splitFields(c.get(3));
+                if (logical) {
+                    List<String> amb = new ArrayList<>();
+                    f1 = toPhysical(parent, f1, amb);
+                    f2 = toPhysical(child, f2, amb);
+                    if (!amb.isEmpty()) {
+                        rep.skip(row.lineNo, "論理名が同じカラムが複数あります: " + String.join(", ", amb));
+                        continue;
+                    }
+                }
                 if (f1.isEmpty() || f2.isEmpty()) {
                     rep.skip(row.lineNo, "親カラム・子カラムが空です");
                     continue;
@@ -2520,12 +2773,32 @@ public final class A5erTool {
                 lines.addAll(newLines);
             }
             lastReport = rep;
-            return new Result(model.file.encode(lines), rep.lines("リレーションを追加"));
+            List<String> log = new ArrayList<>();
+            if (logical) {
+                log.add("（リレーション CSV は論理名で指定）");
+            }
+            log.addAll(rep.lines("リレーションを追加"));
+            return new Result(model.file.encode(lines), log);
+        }
+
+        /** カラムの論理名を物理名に直す。見つからないものはそのまま残す（後の「カラムがありません」で報告）。 */
+        private static List<String> toPhysical(Ent e, List<String> names, List<String> ambiguous) {
+            List<String> out = new ArrayList<>();
+            for (String n : names) {
+                String p = columnByLogical(e, n);
+                if (p == AMBIGUOUS) {
+                    ambiguous.add(e.pname + "." + n);
+                    out.add(n);
+                } else {
+                    out.add(p == null ? n : p);
+                }
+            }
+            return out;
         }
 
         // --- 一括 ---
 
-        /** CSV の種類（"names" / "relations"）をヘッダ行（無ければ列数）で見分ける。 */
+        /** CSV の種類（"names" / "comments" / "relations"）をヘッダ行（無ければ列数）で見分ける。 */
         static String csvKind(byte[] data) throws ToolException {
             for (Csv.Row row : Csv.parse(Csv.decode(data))) {
                 List<String> cells = new ArrayList<>();
@@ -2536,9 +2809,9 @@ public final class A5erTool {
                     continue;
                 }
                 if (cells.get(0).equals(NAMES_HEADER.get(0))) {
-                    return "names";
+                    return cells.size() > 2 && cells.get(2).equals(COMMENTS_HEADER.get(2)) ? "comments" : "names";
                 }
-                if (cells.get(0).equals(RELATIONS_HEADER.get(0))) {
+                if (cells.get(0).equals(RELATIONS_HEADER.get(0)) || cells.get(0).equals(LOGICAL_RELATIONS_HEADER.get(0))) {
                     return "relations";
                 }
                 return cells.size() <= 3 ? "names" : "relations";
@@ -2546,8 +2819,8 @@ public final class A5erTool {
             return "names";
         }
 
-        /** 論理名の反映 → リレーションの追加 → 整列 を順に行う。CSV は null なら使わない。 */
-        static Result runAll(byte[] a5er, byte[] names, byte[] relations, Options opt) throws ToolException {
+        /** 論理名の反映 → コメントの反映 → リレーションの追加 → 整列 を順に行う。CSV は null なら使わない。 */
+        static Result runAll(byte[] a5er, byte[] names, byte[] comments, byte[] relations, Options opt) throws ToolException {
             List<String> log = new ArrayList<>();
             byte[] data = a5er;
             if (names != null) {
@@ -2555,8 +2828,13 @@ public final class A5erTool {
                 data = r.data;
                 log.addAll(r.log);
             }
+            if (comments != null) {
+                Result r = importComments(loadModel(data), comments);
+                data = r.data;
+                log.addAll(r.log);
+            }
             if (relations != null) {
-                Result r = importRelations(loadModel(data), relations);
+                Result r = importRelations(loadModel(data), relations, opt.logicalRelations);
                 data = r.data;
                 log.addAll(r.log);
             }
@@ -2623,9 +2901,14 @@ public final class A5erTool {
         }
 
         static List<String> exportRelations(Path a5er, Path out) throws ToolException {
-            Path dst = out != null ? out : withSuffix(a5er, "relations", ".csv");
+            return exportRelations(a5er, out, false);
+        }
+
+        static List<String> exportRelations(Path a5er, Path out, boolean logical) throws ToolException {
+            Path dst = out != null ? out : withSuffix(a5er, logical ? "relations_logical" : "relations", ".csv");
             checkOutput(dst, List.of(a5er));
-            CsvTools.Result r = CsvTools.exportRelations(CsvTools.loadModel(read(a5er)));
+            CsvTools.Model model = CsvTools.loadModel(read(a5er));
+            CsvTools.Result r = logical ? CsvTools.exportRelationsLogical(model) : CsvTools.exportRelations(model);
             write(dst, r.data);
             return withOutput(r.log, dst);
         }
@@ -2639,19 +2922,39 @@ public final class A5erTool {
         }
 
         static List<String> importRelations(Path a5er, Path csv, Path out) throws ToolException {
+            return importRelations(a5er, csv, out, false);
+        }
+
+        static List<String> importRelations(Path a5er, Path csv, Path out, boolean logicalIfNoHeader) throws ToolException {
             Path dst = out != null ? out : withSuffix(a5er, "relations", ".a5er");
             checkOutput(dst, List.of(a5er, csv));
-            CsvTools.Result r = CsvTools.importRelations(CsvTools.loadModel(read(a5er)), read(csv));
+            CsvTools.Result r = CsvTools.importRelations(CsvTools.loadModel(read(a5er)), read(csv), logicalIfNoHeader);
             write(dst, r.data);
             return withOutput(r.log, dst);
         }
 
-        static List<String> all(Path a5er, Path names, Path relations, Path out, Options opt) throws ToolException {
+        static List<String> exportComments(Path a5er, Path out) throws ToolException {
+            Path dst = out != null ? out : withSuffix(a5er, "comments", ".csv");
+            checkOutput(dst, List.of(a5er));
+            CsvTools.Result r = CsvTools.exportComments(CsvTools.loadModel(read(a5er)));
+            write(dst, r.data);
+            return withOutput(r.log, dst);
+        }
+
+        static List<String> importComments(Path a5er, Path csv, Path out) throws ToolException {
+            Path dst = out != null ? out : withSuffix(a5er, "comments", ".a5er");
+            checkOutput(dst, List.of(a5er, csv));
+            CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(read(a5er)), read(csv));
+            write(dst, r.data);
+            return withOutput(r.log, dst);
+        }
+
+        static List<String> all(Path a5er, Path names, Path comments, Path relations, Path out, Options opt) throws ToolException {
             Path dst = out != null ? out : withSuffix(a5er, "all", ".a5er");
-            List<Path> inputs = new ArrayList<>(Arrays.asList(a5er, names, relations));
+            List<Path> inputs = new ArrayList<>(Arrays.asList(a5er, names, comments, relations));
             checkOutput(dst, inputs);
             CsvTools.Result r = CsvTools.runAll(read(a5er), names == null ? null : read(names),
-                    relations == null ? null : read(relations), opt);
+                    comments == null ? null : read(comments), relations == null ? null : read(relations), opt);
             write(dst, r.data);
             return withOutput(r.log, dst);
         }
@@ -2676,9 +2979,12 @@ public final class A5erTool {
             "  java -jar a5er-tool.jar layout           入力.a5er [-o 出力] [--mode compact|layered|grid] [--keep-lines]",
             "  java -jar a5er-tool.jar export-names     入力.a5er [-o 出力.csv]",
             "  java -jar a5er-tool.jar import-names     入力.a5er 論理名.csv [-o 出力.a5er]",
-            "  java -jar a5er-tool.jar export-relations 入力.a5er [-o 出力.csv]",
-            "  java -jar a5er-tool.jar import-relations 入力.a5er リレーション.csv [-o 出力.a5er]",
-            "  java -jar a5er-tool.jar all              入力.a5er [CSV ...] [-o 出力.a5er] [--mode ...] [--keep-lines]",
+            "  java -jar a5er-tool.jar export-comments  入力.a5er [-o 出力.csv]",
+            "  java -jar a5er-tool.jar import-comments  入力.a5er コメント.csv [-o 出力.a5er]",
+            "  java -jar a5er-tool.jar export-relations 入力.a5er [-o 出力.csv] [--logical]",
+            "  java -jar a5er-tool.jar import-relations 入力.a5er リレーション.csv [-o 出力.a5er] [--logical]",
+            "  java -jar a5er-tool.jar all              入力.a5er [CSV ...] [-o 出力.a5er] [--mode ...] [--keep-lines] [--logical]",
+            "  --logical: リレーション CSV を論理名で書き出す／ヘッダの無いリレーション CSV を論理名として読む",
             "  整列の細かい指定: --gap-x 60 --gap-y 100 --max-width 3000 --margin 50");
 
         static int run(String[] args) {
@@ -2692,6 +2998,7 @@ public final class A5erTool {
                         case "-o": case "--output": out = Paths.get(args[++i]); break;
                         case "--mode": opt.mode = args[++i]; break;
                         case "--keep-lines": opt.keepLines = true; break;
+                        case "--logical": opt.logicalRelations = true; break;
                         case "--gap-x": opt.gapX = Integer.parseInt(args[++i]); break;
                         case "--gap-y": opt.gapY = Integer.parseInt(args[++i]); break;
                         case "--max-width": opt.maxWidth = Integer.parseInt(args[++i]); break;
@@ -2714,31 +3021,30 @@ public final class A5erTool {
                 switch (args[0]) {
                     case "layout": need(paths, 1); log = Actions.layout(paths.get(0), out, opt); break;
                     case "export-names": need(paths, 1); log = Actions.exportNames(paths.get(0), out); break;
-                    case "export-relations": need(paths, 1); log = Actions.exportRelations(paths.get(0), out); break;
+                    case "export-relations": need(paths, 1); log = Actions.exportRelations(paths.get(0), out, opt.logicalRelations); break;
                     case "import-names": need(paths, 2); log = Actions.importNames(paths.get(0), paths.get(1), out); break;
-                    case "import-relations": need(paths, 2); log = Actions.importRelations(paths.get(0), paths.get(1), out); break;
+                    case "export-comments": need(paths, 1); log = Actions.exportComments(paths.get(0), out); break;
+                    case "import-comments": need(paths, 2); log = Actions.importComments(paths.get(0), paths.get(1), out); break;
+                    case "import-relations": need(paths, 2);
+                        log = Actions.importRelations(paths.get(0), paths.get(1), out, opt.logicalRelations); break;
                     case "all": {
                         if (paths.isEmpty()) {
                             throw new ToolException(USAGE);
                         }
-                        Path names = null;
-                        Path rels = null;
+                        Map<String, Path> byKind = new HashMap<>();
+                        Map<String, String> labels = Map.of("names", "論理名", "comments", "コメント", "relations", "リレーション");
                         List<String> head = new ArrayList<>();
                         for (Path p : paths.subList(1, paths.size())) {
                             String kind = CsvTools.csvKind(read(p));
-                            String label = kind.equals("names") ? "論理名" : "リレーション";
-                            if ((kind.equals("names") ? names : rels) != null) {
+                            String label = labels.get(kind);
+                            if (byKind.containsKey(kind)) {
                                 throw new ToolException(label + "の CSV が2つ以上あります: " + p);
                             }
-                            if (kind.equals("names")) {
-                                names = p;
-                            } else {
-                                rels = p;
-                            }
+                            byKind.put(kind, p);
                             head.add(p.getFileName() + " → " + label + "の CSV");
                         }
                         log = new ArrayList<>(head);
-                        log.addAll(Actions.all(paths.get(0), names, rels, out, opt));
+                        log.addAll(Actions.all(paths.get(0), byKind.get("names"), byKind.get("comments"), byKind.get("relations"), out, opt));
                         break;
                     }
                     default: throw new ToolException(USAGE);
@@ -2769,9 +3075,11 @@ public final class A5erTool {
         private final JFrame frame = new JFrame("A5:SQL Mk-2 ER図ツール");
         private final JTextField a5erField = new JTextField(40);
         private final JTextField namesField = new JTextField(40);
+        private final JTextField commentsField = new JTextField(40);
         private final JTextField relationsField = new JTextField(40);
         private final JComboBox<String> modeBox = new JComboBox<>(new String[] {"compact", "layered", "grid"});
         private final JCheckBox keepLines = new JCheckBox("線は変えない（テーブルの位置だけ整列）");
+        private final JCheckBox logicalRels = new JCheckBox("リレーション CSV は論理名");
         private final JTextArea log = new JTextArea(16, 70);
         private final List<JButton> buttons = new ArrayList<>();
         private File lastDir;
@@ -2790,7 +3098,8 @@ public final class A5erTool {
             files.setBorder(BorderFactory.createTitledBorder("ファイル"));
             addFileRow(files, 0, ".a5er ファイル", a5erField, "a5er");
             addFileRow(files, 1, "論理名 CSV（任意）", namesField, "csv");
-            addFileRow(files, 2, "リレーション CSV（任意）", relationsField, "csv");
+            addFileRow(files, 2, "コメント CSV（任意）", commentsField, "csv");
+            addFileRow(files, 3, "リレーション CSV（任意）", relationsField, "csv");
 
             JPanel opts = new JPanel();
             opts.add(new JLabel("並べ方"));
@@ -2798,16 +3107,21 @@ public final class A5erTool {
             modeBox.setToolTipText("compact: 線が重ならないよう正方形に近くまとめる / layered: 親を上・子を下 / grid: 名前順の格子");
             opts.add(modeBox);
             opts.add(keepLines);
+            logicalRels.setToolTipText("書き出しを論理名にする。読み込みは CSV のヘッダで自動判定（ヘッダが無いときだけこのチェックに従う）");
+            opts.add(logicalRels);
 
-            JPanel acts = new JPanel(new GridLayout(2, 3, 6, 6));
+            JPanel acts = new JPanel(new GridLayout(3, 3, 6, 6));
             acts.setBorder(BorderFactory.createTitledBorder("実行（出力は .a5er と同じフォルダに別名で作ります）"));
             acts.add(button("論理名CSVを書き出す", () -> Actions.exportNames(a5er(), null)));
-            acts.add(button("リレーションCSVを書き出す", () -> Actions.exportRelations(a5er(), null)));
-            acts.add(button("整列", () -> Actions.layout(a5er(), null, options())));
+            acts.add(button("コメントCSVを書き出す", () -> Actions.exportComments(a5er(), null)));
+            acts.add(button("リレーションCSVを書き出す", () -> Actions.exportRelations(a5er(), null, logicalRels.isSelected())));
             acts.add(button("論理名を反映", () -> Actions.importNames(a5er(), csv(namesField, "論理名 CSV"), null)));
-            acts.add(button("リレーションを追加", () -> Actions.importRelations(a5er(), csv(relationsField, "リレーション CSV"), null)));
-            acts.add(button("一括（論理名→リレーション→整列）",
-                () -> Actions.all(a5er(), optionalCsv(namesField), optionalCsv(relationsField), null, options())));
+            acts.add(button("コメントを反映", () -> Actions.importComments(a5er(), csv(commentsField, "コメント CSV"), null)));
+            acts.add(button("リレーションを追加", () -> Actions.importRelations(a5er(), csv(relationsField, "リレーション CSV"), null,
+                logicalRels.isSelected())));
+            acts.add(button("整列", () -> Actions.layout(a5er(), null, options())));
+            acts.add(button("一括（論理名→コメント→リレーション→整列）", () -> Actions.all(a5er(), optionalCsv(namesField),
+                optionalCsv(commentsField), optionalCsv(relationsField), null, options())));
 
             log.setEditable(false);
             log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
@@ -2916,6 +3230,7 @@ public final class A5erTool {
             Options o = new Options();
             o.mode = (String) modeBox.getSelectedItem();
             o.keepLines = keepLines.isSelected();
+            o.logicalRelations = logicalRels.isSelected();
             return o;
         }
 

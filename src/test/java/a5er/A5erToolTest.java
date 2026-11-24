@@ -520,6 +520,97 @@ class A5erToolTest {
         assertTrue(t.contains("ZOrder=1\r\n\r\n[Relation]\r\n"));
     }
 
+    // ------------------------------------------------------------------ コメント
+
+    @Test
+    void commentsRoundTripIsIdentical() throws Exception {
+        for (boolean crlf : List.of(false, true)) {
+            byte[] src = sample(crlf, crlf, true);
+            CsvTools.Result exported = CsvTools.exportComments(CsvTools.loadModel(src));
+            assertEquals("テーブル物理名,カラム物理名,コメント", text(exported.data).split("\r\n")[0]);
+            CsvTools.Result out = CsvTools.importComments(CsvTools.loadModel(src), exported.data);
+            assertEquals(text(src), text(out.data));
+            assertTrue(CsvTools.lastReport.skipped.isEmpty());
+        }
+    }
+
+    @Test
+    void commentsImport() throws Exception {
+        byte[] data = csv("UTF-8", "テーブル物理名,カラム物理名,コメント", "users,,会員マスタ", "users,col0,\"A\"\"B,C\"",
+                "ORDERS,COL1,\"1行目\n2行目\"", "nope,col0,x", "users,colX,x", "users,col1,");
+        CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(sample()), data);
+        assertEquals(3, CsvTools.lastReport.done);
+        assertEquals(2, CsvTools.lastReport.skipped.size());
+        String t = text(r.data);
+        assertTrue(t.contains("PName=users\nLName=usersの論理名\nComment=会員マスタ\n"));
+        assertTrue(t.contains("Field=\"列0\",\"col0\",\"@VARCHAR\",\"NOT NULL\",,\"\",\"A\"\"B,C\",$FFFFFFFF,\"\"\n"));
+        assertTrue(t.contains("Field=\"列1\",\"col1\",\"@VARCHAR\",\"NOT NULL\",,\"\",\"1行目\\n2行目\",$FFFFFFFF,\"\"\n"));
+        CsvTools.Model m = CsvTools.loadModel(r.data);
+        assertEquals("A\"B,C", m.findEntities("users").get(0).findColumn("col0").comment);
+        assertEquals("", m.findEntities("products").get(0).findColumn("col1").comment);
+        // 書き出すと同じ値が出る
+        assertTrue(text(CsvTools.exportComments(m).data).contains("users,col0,\"A\"\"B,C\""));
+    }
+
+    @Test
+    void missingCommentLineIsAdded() throws Exception {
+        byte[] src = (HEADER + entity("t1")).replace("Comment=\n", "").getBytes(StandardCharsets.UTF_8);
+        CsvTools.Result r = CsvTools.importComments(CsvTools.loadModel(src), csv("UTF-8", "t1,,説明"));
+        assertEquals(1, CsvTools.lastReport.done);
+        assertTrue(text(r.data).contains("LName=t1の論理名\nComment=説明\nTableOption=\n"));
+    }
+
+    // ------------------------------------------------------------------ リレーション（論理名）
+
+    /** テーブルの論理名を「論理X」にしたサンプル。 */
+    static byte[] logicalSample() {
+        return text(sample()).replaceAll("LName=(\\w+)の論理名", "LName=論理$1").getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void logicalRelationsRoundTrip() throws Exception {
+        byte[] src = logicalSample();
+        CsvTools.Result exported = CsvTools.exportRelationsLogical(CsvTools.loadModel(src));
+        String[] rows = text(exported.data).split("\r\n");
+        assertEquals("親テーブル論理名,子テーブル論理名,親カラム論理名,子カラム論理名,親側種別,子側種別,依存", rows[0]);
+        assertEquals("論理users,論理orders,列0,列1,2,3,0", rows[1]);
+        // リレーションを消した図に読み込むと同じ 5 本ができる
+        String noRel = text(src).substring(0, text(src).indexOf("[Relation]"));
+        CsvTools.Result r = CsvTools.importRelations(CsvTools.loadModel(noRel.getBytes(StandardCharsets.UTF_8)), exported.data);
+        assertEquals(5, CsvTools.lastReport.done);
+        assertEquals(text(CsvTools.exportRelations(CsvTools.loadModel(src)).data),
+                text(CsvTools.exportRelations(CsvTools.loadModel(r.data)).data));
+        // 同じ図に読み込むと何も足さない
+        CsvTools.importRelations(CsvTools.loadModel(src), exported.data);
+        assertEquals(5, CsvTools.lastReport.unchanged);
+    }
+
+    @Test
+    void logicalRelationsAmbiguousAndFallback() throws Exception {
+        String s = text(logicalSample()).replace("LName=論理settings", "LName=論理logs");
+        s = s.replace("PName=products\nLName=論理products", "PName=products\nLName=");
+        byte[] src = s.getBytes(StandardCharsets.UTF_8);
+        String header = "親テーブル論理名,子テーブル論理名,親カラム論理名,子カラム論理名,親側種別,子側種別,依存";
+        CsvTools.importRelations(CsvTools.loadModel(src), csv("UTF-8", header, "論理users,論理logs,列0,列1,,,",
+                "論理users,products,列0,col1,,,", "論理users,論理orders,列X,列1,,,"));
+        assertEquals(1, CsvTools.lastReport.done); // products は論理名が空なので物理名で見つかる
+        assertEquals(2, CsvTools.lastReport.skipped.size());
+        assertTrue(CsvTools.lastReport.skipped.get(0).contains("複数"));
+        // 論理名が空のテーブルは物理名で書き出す
+        CsvTools.Result ex = CsvTools.exportRelationsLogical(CsvTools.loadModel(src));
+        assertTrue(text(ex.data).contains("論理categories,products,列0,列1,2,3,0"));
+        assertTrue(ex.log.stream().anyMatch(l -> l.startsWith("論理名が無いため物理名で書いた箇所: 2")));
+    }
+
+    @Test
+    void logicalRelationsWithoutHeader() throws Exception {
+        byte[] data = csv("UTF-8", "論理logs,論理settings,列0,列1");
+        CsvTools.importRelations(CsvTools.loadModel(logicalSample()), data, false);
+        assertEquals(0, CsvTools.lastReport.done);
+        CsvTools.importRelations(CsvTools.loadModel(logicalSample()), data, true);
+        assertEquals(1, CsvTools.lastReport.done);
+    }
+
     // ------------------------------------------------------------------ 一括・コマンド
 
     @Test
@@ -528,13 +619,27 @@ class A5erToolTest {
         assertEquals("relations", CsvTools.csvKind(csv("UTF-8", "親テーブル,子テーブル,親カラム,子カラム,親側種別,子側種別,依存")));
         assertEquals("names", CsvTools.csvKind(csv("MS932", "a,,x")));
         assertEquals("relations", CsvTools.csvKind(csv("UTF-8", "a,b,c,d")));
+        assertEquals("comments", CsvTools.csvKind(csv("UTF-8", "テーブル物理名,カラム物理名,コメント")));
+        assertEquals("relations", CsvTools.csvKind(csv("UTF-8", "親テーブル論理名,子テーブル論理名,親カラム論理名,子カラム論理名,,,")));
+    }
+
+    @Test
+    void runAllWithCommentsAndLogicalRelations() throws Exception {
+        byte[] comments = csv("UTF-8", "テーブル物理名,カラム物理名,コメント", "logs,col0,ログの番号");
+        byte[] rels = csv("UTF-8", "親テーブル論理名,子テーブル論理名,親カラム論理名,子カラム論理名,親側種別,子側種別,依存",
+                "論理logs,論理settings,列0,列1,,,");
+        CsvTools.Result r = CsvTools.runAll(logicalSample(), null, comments, rels, new Options());
+        String t = text(r.data);
+        assertTrue(t.contains("\"ログの番号\""));
+        assertTrue(t.contains("Entity1=logs\nEntity2=settings\n"));
+        assertTrue(r.log.get(0).startsWith("コメントを反映 1 件"));
     }
 
     @Test
     void runAll() throws Exception {
         byte[] names = csv("UTF-8", "logs,col0,ログID", "nope,x,y");
         byte[] rels = csv("UTF-8", "親テーブル,子テーブル,親カラム,子カラム,親側種別,子側種別,依存", "logs,settings,col0,col1,,,");
-        CsvTools.Result r = CsvTools.runAll(sample(), names, rels, new Options());
+        CsvTools.Result r = CsvTools.runAll(sample(), names, null, rels, new Options());
         String t = text(r.data);
         assertTrue(t.contains("Field=\"ログID\",\"col0\""));
         assertTrue(t.contains("Entity1=logs\nEntity2=settings\n"));
@@ -552,6 +657,10 @@ class A5erToolTest {
         assertEquals(0, A5erTool.Cli.run(new String[] {"export-relations", src.toString()}));
         assertEquals(0, A5erTool.Cli.run(new String[] {"import-names", src.toString(), dir.resolve("er_names.csv").toString()}));
         assertEquals(0, A5erTool.Cli.run(new String[] {"import-relations", src.toString(), dir.resolve("er_relations.csv").toString()}));
+        assertEquals(0, A5erTool.Cli.run(new String[] {"export-comments", src.toString()}));
+        assertEquals(0, A5erTool.Cli.run(new String[] {"import-comments", src.toString(), dir.resolve("er_comments.csv").toString()}));
+        assertEquals(0, A5erTool.Cli.run(new String[] {"export-relations", src.toString(), "--logical"}));
+        assertTrue(Files.isRegularFile(dir.resolve("er_relations_logical.csv")));
         assertEquals(0, A5erTool.Cli.run(new String[] {"layout", src.toString()}));
         assertEquals(0, A5erTool.Cli.run(new String[] {"all", src.toString(), dir.resolve("er_relations.csv").toString(),
             dir.resolve("er_names.csv").toString()}));
