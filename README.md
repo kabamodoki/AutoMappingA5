@@ -113,6 +113,25 @@ java -jar target/a5er-tool.jar all              入力.a5er [CSV ...] [-o 出力
 `layout` と `all` には `--paper a-landscape|a-portrait|b-landscape|b-portrait|keep`（用紙。既定 a-landscape）も付けられます。
 `all` は CSV の種類を 1 行目のヘッダで見分けます。
 
+## Salesforce の定義から CSV を作る（補助ツール SfToCsv）
+Salesforce のオブジェクト定義から、このツールでそのまま読める CSV を 3 つ作ります。
+- `sf_names.csv`（論理名）: オブジェクトの API 名 → 表示ラベル、項目の API 名 → 表示ラベル
+- `sf_relations.csv`（リレーション）: 参照・主従関係の項目ごとに「参照先.Id → その項目」
+- `sf_comments.csv`（コメント）: 説明（メタデータの description。組織から取るときは inlineHelpText）
+
+```
+java -cp target/a5er-tool.jar a5er.SfToCsv            画面で使う
+java -cp target/a5er-tool.jar a5er.SfToCsv folder メタデータのフォルダ [-o 出力フォルダ] [--objects A__c,B__c] [--all-relations]
+java -cp target/a5er-tool.jar a5er.SfToCsv org    sf の組織の別名      [同上]
+java -cp target/a5er-tool.jar a5er.SfToCsv api    インスタンスURL アクセストークン [同上] [--api 60.0]
+```
+- **folder**: `sf project retrieve start` などで取ってきたメタデータ（`objects/` の SFDX 形式・`.object` 形式どちらも）を読みます。組織にはつなぎません。メタデータに無い `Id`・`Name` は足します
+- **org**: Salesforce CLI（`sf`）でログイン済みの組織の別名を指定すると、その接続情報で REST API から定義を取ります
+- 対象は既定でカスタムオブジェクト（`__c`）全部。`--objects` で標準オブジェクトも含めて指定できます
+- リレーションは既定で、両端とも対象のオブジェクトのものだけ出します（所有者・作成者などの User への参照を除くため）。全部出すときは `--all-relations`
+- 物理名は API 名で出します。ER 図側のテーブル名・カラム名が小文字でも、大文字小文字を区別せずに照合します
+- ソースは `src/main/java/a5er/SfToCsv.java` の 1 ファイルで、本体には依存しません。ビルドせずに `java src/main/java/a5er/SfToCsv.java folder ...` でも動きます
+
 ## 動作確認用のサンプル DB（sample-db/）
 通販サイト風の 20 テーブルが入った PostgreSQL です（外部キーなし）。
 ```
@@ -127,7 +146,8 @@ docker compose up -d      # 止めるときは docker compose down
 ## 構成
 ```
 pom.xml
-src/main/java/a5er/A5erTool.java      ツールのすべて（1 ファイル）
-src/test/java/a5er/A5erToolTest.java  テスト（JUnit 5。mvn package で実行されます）
+src/main/java/a5er/A5erTool.java      ER 図ツールのすべて（1 ファイル）
+src/main/java/a5er/SfToCsv.java       Salesforce の定義 → CSV の補助ツール（1 ファイル）
+src/test/java/a5er/                   テスト（JUnit 5。mvn package で実行されます）
 sample-db/                            動作確認用 DB
 ```
